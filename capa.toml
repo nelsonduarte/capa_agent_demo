@@ -1,0 +1,21 @@
+# capa_agent_demo package manifest.
+#
+# Two seed-library dependencies, both pinned to v0.1.2 with
+# verify_key so capa install enforces the full three-layer
+# supply-chain check (lockfile SHA + GPG signature + SLSA L2
+# build provenance via Sigstore Rekor) on every install.
+
+[package]
+name = "capa_agent_demo"
+version = "0.1.0"
+capa = ">=0.8.4"
+
+[dependencies.capa_http]
+git = "https://github.com/nelsonduarte/capa_http"
+tag = "v0.1.2"
+verify_key = "6C1D222D491FB88031E041A536CFB426101AA24B"
+
+[dependencies.capa_log]
+git = "https://github.com/nelsonduarte/capa_log"
+tag = "v0.1.2"
+verify_key = "6C1D222D491FB88031E041A536CFB426101AA24B"

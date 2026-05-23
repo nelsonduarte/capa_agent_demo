@@ -1,0 +1,6 @@
+vendor/
+
+# Capa CLI side-products
+_manifest.json
+manifest.json
+_*.py

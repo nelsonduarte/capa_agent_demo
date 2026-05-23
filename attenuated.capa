@@ -1,0 +1,93 @@
+// attenuated.capa
+//
+// Attenuated capability wrappers for the agent harness. The point
+// of this file is the cap-shape demo: an LLM-driven tool has only
+// the authority the harness handed in, not the full ``Fs`` or
+// ``Http`` the harness has access to. If the LLM gets prompt-
+// injected into emitting ``read_file("/etc/passwd")``, the tool
+// function CAN do that (it has ``ReadOnlyFs``) -- but if the
+// prompt says ``write_file("/etc/passwd", attacker_payload)``,
+// the call literally does not compile: ``ReadOnlyFs`` has no
+// ``write_file`` method. The manifest is the contract.
+//
+// Two wrappers:
+//
+//   ``ReadOnlyFs``    : Fs without ``write_file`` or ``mkdir``.
+//                       Read + list only.
+//   ``GetOnlyHttp``   : Http restricted to GET, against a
+//                       caller-supplied allow-list of hostnames.
+//                       No POST, no PUT, no DELETE, no methods
+//                       at all other than GET.
+//
+// Both are cap-bearing structs: they hold the unattenuated
+// built-in capability internally, expose only the narrowed
+// surface. Past the ``make_*`` factory the underlying ``Fs`` /
+// ``Http`` is invisible to consumers.
+
+import capa_http.http
+
+// =========================================================
+// ReadOnlyFs
+// =========================================================
+
+pub capability ReadOnlyFs
+    fun read_file(self, path: String) -> Result<String, IoError>
+    fun list_dir(self, path: String) -> Result<List<String>, IoError>
+
+pub type ReadOnlyFsImpl {
+    fs: Fs
+}
+
+pub fun make_readonly_fs(fs: Fs) -> ReadOnlyFsImpl
+    return ReadOnlyFsImpl { fs: fs }
+
+impl ReadOnlyFs for ReadOnlyFsImpl
+    fun read_file(self, path: String) -> Result<String, IoError>
+        return self.fs.read(path)
+
+    fun list_dir(self, path: String) -> Result<List<String>, IoError>
+        return self.fs.list_dir(path)
+
+// =========================================================
+// GetOnlyHttp
+// =========================================================
+//
+// Restricts the underlying Http to GET, AND to an allow-list of
+// hostnames. Both restrictions enforced at the wrapper boundary
+// before the underlying ``Http.send`` ever sees the request.
+//
+// Hostname check is a simple ``url.contains("://${host}/")``
+// scan; a real production wrapper would parse the URL properly.
+// For demo purposes the simple form makes the security claim
+// auditable in 5 lines.
+
+pub capability GetOnlyHttp
+    fun get(self, url: String) -> Result<String, HttpError>
+
+pub type GetOnlyHttpImpl {
+    http: Http,
+    allowed_hosts: List<String>
+}
+
+pub fun make_get_only_http(http: Http, allowed_hosts: List<String>) -> GetOnlyHttpImpl
+    return GetOnlyHttpImpl { http: http, allowed_hosts: allowed_hosts }
+
+fun host_allowed(url: String, hosts: List<String>) -> Bool
+    for h in hosts
+        if url.contains("://${h}/") or url.contains("://${h}:")
+            return true
+    return false
+
+impl GetOnlyHttp for GetOnlyHttpImpl
+    fun get(self, url: String) -> Result<String, HttpError>
+        if not host_allowed(url, self.allowed_hosts)
+            return Err(InvalidRequest("host not in allow-list: ${url}"))
+        let req = Request {
+            method: "GET",
+            url: url,
+            headers: [],
+            body: None,
+            timeout_secs: 30.0
+        }
+        let resp: Response = self.http.send(req)?
+        return Ok(resp.body)

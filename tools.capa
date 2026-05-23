@@ -1,0 +1,149 @@
+// tools.capa
+//
+// The set of tools the LLM is allowed to call. Each tool is a
+// plain Capa function whose capability bound matches its
+// declared authority and *nothing more*. The agent harness in
+// agent.capa wires these into the dispatcher; the LLM sees the
+// schemas declared in ``tool_decls`` and never the function
+// bodies.
+//
+// Audit story (run ``capa --manifest tools.capa``):
+//
+//   tool_read_file:    ['ReadOnlyFs']
+//   tool_list_dir:     ['ReadOnlyFs']
+//   tool_get_url:      ['GetOnlyHttp']
+//   tool_current_time: ['Clock']
+//   dispatch_tool:     ['ReadOnlyFs', 'GetOnlyHttp', 'Clock']
+//
+// The dispatcher's surface IS the agent's blast radius: read
+// files, list dirs, GET allow-listed URLs, read clock. No write,
+// no POST, no Net to arbitrary hosts, no Db, no Unsafe. Even
+// total prompt-injection cannot widen this set because the
+// dispatcher's signature literally does not name a write
+// authority.
+
+import attenuated
+import llm_client
+
+// =========================================================
+// Individual tool functions
+// =========================================================
+
+pub fun tool_read_file(fs: ReadOnlyFs, path: String) -> String
+    match fs.read_file(path)
+        Ok(text) -> return text
+        Err(io)  -> return "error: ${io.message}"
+
+pub fun tool_list_dir(fs: ReadOnlyFs, path: String) -> String
+    match fs.list_dir(path)
+        Ok(entries) ->
+            var out = ""
+            var first = true
+            for e in entries
+                if not first
+                    out = out + "\n"
+                out = out + e
+                first = false
+            return out
+        Err(io) -> return "error: ${io.message}"
+
+pub fun tool_get_url(http: GetOnlyHttp, url: String) -> String
+    match http.get(url)
+        Ok(body) -> return body
+        Err(he)  ->
+            let msg = match he
+                NetworkFailure(m) -> m
+                InvalidRequest(m) -> m
+            return "error: ${msg}"
+
+pub fun tool_current_time(clock: Clock) -> String
+    let secs = clock.now_secs()
+    return "${secs}"
+
+// =========================================================
+// Dispatcher
+// =========================================================
+//
+// Tools are picked by name. ``input_json`` is the raw JSON
+// object the LLM emitted as the tool's input; we extract the
+// expected string field for each tool. Unknown names yield a
+// generic error string; the agent loop forwards it back to the
+// model so the model can adjust.
+
+fun extract_string_field(input_json: String, field: String) -> String
+    match parse_json(input_json)
+        Err(_) -> return ""
+        Ok(jv) ->
+            match jv.as_object()
+                None -> return ""
+                Some(obj) ->
+                    match obj.get(field)
+                        None -> return ""
+                        Some(v) ->
+                            match v.as_string()
+                                Some(s) -> return s
+                                None    -> return ""
+
+pub fun dispatch_tool(
+    fs: ReadOnlyFs,
+    http: GetOnlyHttp,
+    clock: Clock,
+    name: String,
+    input_json: String
+) -> String
+    if name == "read_file"
+        let path = extract_string_field(input_json, "path")
+        if path == ""
+            return "error: read_file requires {\"path\": \"<path>\"}"
+        return tool_read_file(fs, path)
+    if name == "list_dir"
+        let path = extract_string_field(input_json, "path")
+        if path == ""
+            return "error: list_dir requires {\"path\": \"<path>\"}"
+        return tool_list_dir(fs, path)
+    if name == "get_url"
+        let url = extract_string_field(input_json, "url")
+        if url == ""
+            return "error: get_url requires {\"url\": \"<url>\"}"
+        return tool_get_url(http, url)
+    if name == "current_time"
+        return tool_current_time(clock)
+    return "error: unknown tool '${name}'"
+
+// =========================================================
+// Tool declarations (sent to the LLM each turn)
+// =========================================================
+//
+// Each ToolDecl carries:
+//   * name: how the model addresses the tool;
+//   * description: prose the model uses to pick a tool;
+//   * input_schema: a raw JSON Schema string for the input
+//     object the model must emit.
+//
+// The schemas are intentionally minimal. A richer ``properties``
+// block (enums, regex patterns, required arrays of length > 1)
+// is a v0.2 polish.
+
+pub fun tool_decls() -> List<ToolDecl>
+    return [
+        ToolDecl {
+            name: "read_file",
+            description: "Read the contents of a file from disk. The path must be a valid filesystem path. Returns the file's text contents, or an error string starting with 'error:'.",
+            input_schema: "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"The filesystem path to read.\"}}, \"required\": [\"path\"]}"
+        },
+        ToolDecl {
+            name: "list_dir",
+            description: "List the entries in a directory on disk. Returns the entry names one per line, or an error string starting with 'error:'.",
+            input_schema: "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"The directory path to list.\"}}, \"required\": [\"path\"]}"
+        },
+        ToolDecl {
+            name: "get_url",
+            description: "Fetch the contents of an HTTP URL with a GET request. Only hosts on the agent's allow-list will succeed; others return an error string. Returns the response body as text.",
+            input_schema: "{\"type\": \"object\", \"properties\": {\"url\": {\"type\": \"string\", \"description\": \"The URL to fetch (must be on the allow-list).\"}}, \"required\": [\"url\"]}"
+        },
+        ToolDecl {
+            name: "current_time",
+            description: "Get the current wall-clock time as Unix seconds since 1970-01-01 UTC. Takes no arguments.",
+            input_schema: "{\"type\": \"object\", \"properties\": {}}"
+        }
+    ]

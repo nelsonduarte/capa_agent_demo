@@ -1,0 +1,274 @@
+// llm_client.capa
+//
+// The LlmClient capability and its Anthropic Messages-API
+// implementor. The capability surface is provider-agnostic: a
+// caller that takes ``llm: LlmClient`` cannot tell whether the
+// concrete implementor talks to Anthropic, to OpenAI, or to an
+// in-memory mock. The Anthropic-specific JSON wrangling +
+// HTTP wiring all live inside ``AnthropicClient`` and never
+// leak past the factory.
+//
+// The agent loop in agent.capa declares
+// ``llm: LlmClient`` and a tiny set of attenuated I/O caps.
+// Even if the model is prompt-injected into emitting a tool
+// call whose name is ``rm -rf /``, the harness only knows the
+// few tools it registered; it cannot synthesise new ones
+// because the dispatcher is closed over the registered set.
+//
+// Provider scope (v0.1): Anthropic Messages API only,
+// claude-haiku-4-5 by default. Adding OpenAI / Bedrock /
+// local-Ollama means: new implementor of the same
+// ``LlmClient`` capability, no change to the agent.
+
+import capa_http.http
+
+// =========================================================
+// Capability surface
+// =========================================================
+
+// A single turn from the model. The agent inspects this and
+// either dispatches a tool (``ToolUse``) or finishes
+// (``Done``). ``Failed`` carries a string the agent shows the
+// user but does not try to recover from.
+pub type LlmTurn =
+    Done(String)
+    ToolUse(String, String, String)
+    Failed(String)
+
+pub type LlmError =
+    LlmHttpError(String)
+    LlmBadResponse(String)
+
+// A message in the conversation history. Anthropic-specific
+// JSON shapes are constructed inside the implementor; this
+// type stays provider-agnostic.
+pub type Message =
+    UserText(String)
+    AssistantText(String)
+    AssistantToolUse(String, String, String)
+    ToolResult(String, String)
+
+// Declaration of a tool the model is allowed to call. The
+// schema string is raw JSON Schema for the tool's input
+// object; the implementor splices it directly into the
+// outgoing request.
+pub type ToolDecl {
+    name: String,
+    description: String,
+    input_schema: String
+}
+
+pub capability LlmClient
+    fun send(self, messages: List<Message>, tools: List<ToolDecl>) -> Result<LlmTurn, LlmError>
+
+// =========================================================
+// AnthropicClient: the Http-bearing implementor
+// =========================================================
+//
+// Holds the raw ``Http`` capability that the harness's
+// ``main`` constructed once via ``make_urllib_client(u)``.
+// Past the ``make_anthropic_client`` factory, callers see
+// only ``LlmClient``; the Http authority does not appear in
+// their manifest.
+
+pub type AnthropicClient {
+    http: Http,
+    api_key: String,
+    model: String
+}
+
+pub fun make_anthropic_client(http: Http, api_key: String, model: String) -> AnthropicClient
+    return AnthropicClient { http: http, api_key: api_key, model: model }
+
+// =========================================================
+// Outgoing JSON construction
+// =========================================================
+
+fun message_to_json(m: Message) -> JsonValue
+    var obj: Map<String, JsonValue> = new_map()
+    match m
+        UserText(text) ->
+            obj.set("role", JStr("user"))
+            obj.set("content", JStr(text))
+        AssistantText(text) ->
+            obj.set("role", JStr("assistant"))
+            obj.set("content", JStr(text))
+        AssistantToolUse(id, name, input_json) ->
+            obj.set("role", JStr("assistant"))
+            var block: Map<String, JsonValue> = new_map()
+            block.set("type", JStr("tool_use"))
+            block.set("id", JStr(id))
+            block.set("name", JStr(name))
+            // ``input`` field expects the actual JSON object,
+            // not a quoted string. Parse the stored payload.
+            match parse_json(input_json)
+                Ok(jv) -> block.set("input", jv)
+                Err(_) ->
+                    var empty: Map<String, JsonValue> = new_map()
+                    block.set("input", JObj(empty))
+            obj.set("content", JArr([JObj(block)]))
+        ToolResult(id, content) ->
+            obj.set("role", JStr("user"))
+            var block: Map<String, JsonValue> = new_map()
+            block.set("type", JStr("tool_result"))
+            block.set("tool_use_id", JStr(id))
+            block.set("content", JStr(content))
+            obj.set("content", JArr([JObj(block)]))
+    return JObj(obj)
+
+fun tool_to_json(t: ToolDecl) -> JsonValue
+    var obj: Map<String, JsonValue> = new_map()
+    obj.set("name", JStr(t.name))
+    obj.set("description", JStr(t.description))
+    match parse_json(t.input_schema)
+        Ok(schema) -> obj.set("input_schema", schema)
+        Err(_)     ->
+            var empty: Map<String, JsonValue> = new_map()
+            obj.set("input_schema", JObj(empty))
+    return JObj(obj)
+
+fun build_request_body(model: String, messages: List<Message>, tools: List<ToolDecl>) -> String
+    var msgs: List<JsonValue> = []
+    for m in messages
+        msgs.push(message_to_json(m))
+
+    var tools_arr: List<JsonValue> = []
+    for t in tools
+        tools_arr.push(tool_to_json(t))
+
+    var body: Map<String, JsonValue> = new_map()
+    body.set("model", JStr(model))
+    body.set("max_tokens", JNum(1024.0))
+    body.set("messages", JArr(msgs))
+    body.set("tools", JArr(tools_arr))
+    return to_json(JObj(body))
+
+// =========================================================
+// Response parsing
+// =========================================================
+//
+// The Anthropic response is shaped roughly:
+//
+//   {
+//     "stop_reason": "tool_use" | "end_turn" | ...,
+//     "content": [
+//       {"type": "text", "text": "..."},
+//       {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+//     ]
+//   }
+//
+// On ``stop_reason == "tool_use"`` we hunt for the first
+// tool_use block (the model can emit text and a tool_use in
+// the same turn; v0.1 ignores the text). On ``end_turn`` we
+// concatenate the text blocks. Anything else lands in
+// ``Failed``.
+
+fun extract_text(content: List<JsonValue>) -> String
+    var out = ""
+    for block in content
+        match block.as_object()
+            None -> ()
+            Some(obj) ->
+                match obj.get("type")
+                    Some(jt) ->
+                        match jt.as_string()
+                            Some(t) ->
+                                if t == "text"
+                                    match obj.get("text")
+                                        Some(jx) ->
+                                            match jx.as_string()
+                                                Some(s) -> out = out + s
+                                                None    -> ()
+                                        None -> ()
+                            None -> ()
+                    None -> ()
+    return out
+
+fun extract_tool_use(content: List<JsonValue>) -> Option<(String, String, String)>
+    for block in content
+        match block.as_object()
+            None -> ()
+            Some(obj) ->
+                let kind = match obj.get("type")
+                    Some(jt) ->
+                        match jt.as_string()
+                            Some(t) -> t
+                            None    -> ""
+                    None -> ""
+                if kind == "tool_use"
+                    let id = match obj.get("id")
+                        Some(j) ->
+                            match j.as_string()
+                                Some(s) -> s
+                                None    -> ""
+                        None -> ""
+                    let name = match obj.get("name")
+                        Some(j) ->
+                            match j.as_string()
+                                Some(s) -> s
+                                None    -> ""
+                        None -> ""
+                    let input_str = match obj.get("input")
+                        Some(j) -> to_json(j)
+                        None    -> "{}"
+                    return Some((id, name, input_str))
+    return None
+
+fun parse_anthropic_response(body: String) -> LlmTurn
+    match parse_json(body)
+        Err(msg) -> return Failed("bad JSON in response: ${msg}")
+        Ok(root) ->
+            match root.as_object()
+                None -> return Failed("response root is not an object")
+                Some(obj) ->
+                    let stop = match obj.get("stop_reason")
+                        Some(j) ->
+                            match j.as_string()
+                                Some(s) -> s
+                                None    -> ""
+                        None -> ""
+                    let content_jv = match obj.get("content")
+                        Some(j) -> j
+                        None    -> JArr([])
+                    let content = match content_jv.as_array()
+                        Some(arr) -> arr
+                        None      -> []
+                    if stop == "tool_use"
+                        match extract_tool_use(content)
+                            Some(tup) ->
+                                let (id, name, input) = tup
+                                return ToolUse(id, name, input)
+                            None ->
+                                return Failed("stop_reason=tool_use but no tool_use block")
+                    if stop == "end_turn"
+                        return Done(extract_text(content))
+                    return Failed("unexpected stop_reason: ${stop}")
+
+// =========================================================
+// The implementation
+// =========================================================
+
+impl LlmClient for AnthropicClient
+    fun send(self, messages: List<Message>, tools: List<ToolDecl>) -> Result<LlmTurn, LlmError>
+        let body_str = build_request_body(self.model, messages, tools)
+        let req = Request {
+            method: "POST",
+            url: "https://api.anthropic.com/v1/messages",
+            headers: [
+                ("x-api-key", self.api_key),
+                ("anthropic-version", "2023-06-01"),
+                ("content-type", "application/json")
+            ],
+            body: Some(body_str),
+            timeout_secs: 60.0
+        }
+        let resp: Response = match self.http.send(req)
+            Ok(r)  -> r
+            Err(e) ->
+                let msg = match e
+                    NetworkFailure(m) -> m
+                    InvalidRequest(m) -> m
+                return Err(LlmHttpError(msg))
+        if resp.status < 200 or resp.status >= 300
+            return Err(LlmHttpError("HTTP ${resp.status}: ${resp.body}"))
+        return Ok(parse_anthropic_response(resp.body))

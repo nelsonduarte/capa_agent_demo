@@ -1,0 +1,133 @@
+// agent.capa
+//
+// The agent loop. Reads a user prompt off argv, asks the LLM,
+// dispatches tools when the model emits a ``tool_use``, sends
+// the tool result back, repeats up to MAX_ITERS turns.
+//
+// The capability bound on ``run_agent_loop`` is the entire
+// blast radius of the LLM:
+//
+//   run_agent_loop: ['Stdio', 'LlmClient', 'ReadOnlyFs',
+//                    'GetOnlyHttp', 'Clock', 'Logger']
+//
+// No ``Fs`` (write-capable), no ``Http`` (POST-capable), no
+// ``Net``, no ``Db``, no ``Unsafe``. Even total prompt-injection
+// cannot escape this surface because the function literally
+// does not name those authorities. The auditor reads the line
+// above and they are done -- they do not need to read the
+// implementation.
+//
+// ``main`` is the wiring point. It is the only function that
+// names ``Unsafe`` (used once to materialise the urllib client
+// + the real-Fs / real-Clock factories), and the only function
+// that names raw ``Http`` (handed to the AnthropicClient and
+// the GetOnlyHttp factories). Past ``main`` the unattenuated
+// caps are invisible.
+
+import attenuated
+import llm_client
+import tools
+import capa_http.urllib_client
+import capa_log.log
+import capa_log.stdio_logger
+
+const MAX_ITERS: Int = 5
+const MODEL: String  = "claude-haiku-4-5-20251001"
+
+// Hosts the agent's ``get_url`` tool is allowed to reach. An
+// empty list means no GET works; the agent then can only use
+// read_file / list_dir / current_time. The demo's prompt
+// happens to use wttr.in for live weather; tighten as needed.
+fun allowed_hosts() -> List<String>
+    return ["wttr.in", "api.github.com"]
+
+// =========================================================
+// Display helpers
+// =========================================================
+
+fun truncate(s: String, max_len: Int) -> String
+    if s.length() <= max_len
+        return s
+    return s.substring(0, max_len) + "... [truncated]"
+
+fun print_banner(stdio: Stdio, label: String, body: String)
+    stdio.println("[${label}] ${truncate(body, 240)}")
+
+// =========================================================
+// The loop
+// =========================================================
+
+pub fun run_agent_loop(
+    stdio: Stdio,
+    log: Logger,
+    llm: LlmClient,
+    fs: ReadOnlyFs,
+    http: GetOnlyHttp,
+    clock: Clock,
+    user_prompt: String
+) -> Int
+    let tools = tool_decls()
+    var messages: List<Message> = [UserText(user_prompt)]
+    print_banner(stdio, "user", user_prompt)
+
+    var iter = 0
+    while iter < MAX_ITERS
+        log.info("turn ${iter + 1}/${MAX_ITERS}")
+        let turn: Result<LlmTurn, LlmError> = llm.send(messages, tools)
+        match turn
+            Err(e) ->
+                let msg = match e
+                    LlmHttpError(m)    -> m
+                    LlmBadResponse(m) -> m
+                stdio.eprintln("[llm error] ${msg}")
+                return 1
+            Ok(Done(text)) ->
+                print_banner(stdio, "llm", text)
+                return 0
+            Ok(Failed(msg)) ->
+                stdio.eprintln("[llm failed] ${msg}")
+                return 1
+            Ok(ToolUse(id, name, input_json)) ->
+                print_banner(stdio, "tool call", "${name}(${input_json})")
+                messages.push(AssistantToolUse(id, name, input_json))
+                let result = dispatch_tool(fs, http, clock, name, input_json)
+                print_banner(stdio, "tool result", result)
+                messages.push(ToolResult(id, result))
+        iter = iter + 1
+
+    stdio.eprintln("[agent] iteration limit (${MAX_ITERS}) hit without an end_turn")
+    return 1
+
+// =========================================================
+// Wiring point
+// =========================================================
+//
+// The ONLY function in the program that names ``Unsafe`` and
+// raw ``Http``. After the three factory calls below, the rest
+// of the program sees only the attenuated caps + LlmClient.
+
+fun first_arg_or(args: List<String>, fallback: String) -> String
+    if args.length() <= 1
+        return fallback
+    match args.get(1)
+        Some(s) -> return s
+        None    -> return fallback
+
+fun main(stdio: Stdio, env: Env, clock: Clock, fs: Fs, u: Unsafe) -> Int
+    let log = make_stdio_logger(stdio, INFO)
+    let args = env.args()
+    let prompt = first_arg_or(args, "What is the current time as a human-readable date? Use the current_time tool.")
+
+    let api_key = match env.get("ANTHROPIC_API_KEY")
+        Some(k) -> k
+        None    -> ""
+    if api_key == ""
+        stdio.eprintln("error: set ANTHROPIC_API_KEY in the environment")
+        return 1
+
+    let http_raw = make_urllib_client(u)
+    let llm = make_anthropic_client(http_raw, api_key, MODEL)
+    let fs_ro = make_readonly_fs(fs)
+    let http_get = make_get_only_http(http_raw, allowed_hosts())
+
+    return run_agent_loop(stdio, log, llm, fs_ro, http_get, clock, prompt)

@@ -1,0 +1,25 @@
+Capa is dual-licensed under either of:
+
+  * The MIT License ([LICENSE-MIT](./LICENSE-MIT))
+  * The Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE))
+
+at your option.
+
+The SPDX expression for this dual-license is `MIT OR Apache-2.0`,
+the same idiom used by the Rust project. Pick whichever fits your
+distribution constraints; using one does not waive your right to
+later distribute the same Work under the other.
+
+Why both? MIT keeps the friction-free permissive story Capa shipped
+with originally, while Apache-2.0 carries an explicit patent grant
+(Section 3) and a termination clause against litigants. The patent
+grant matters for Capa specifically because the project sits in a
+regulated supply-chain story (EU CRA, NIS2, DORA) where institutional
+adopters tend to prefer or require the Apache-style protection.
+
+## Contributions
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the
+Apache 2.0 license, shall be dual-licensed as above, without any
+additional terms or conditions.
