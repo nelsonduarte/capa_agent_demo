@@ -107,9 +107,10 @@ pub fun run_agent_loop(
 // of the program sees only the attenuated caps + LlmClient.
 
 fun first_arg_or(args: List<String>, fallback: String) -> String
-    if args.length() <= 1
-        return fallback
-    match args.get(1)
+    // ``env.args()`` returns ``sys.argv[1:]`` (the program name is
+    // already stripped), so index 0 is the first user-supplied
+    // argument.
+    match args.get(0)
         Some(s) -> return s
         None    -> return fallback
 
@@ -124,6 +125,18 @@ fun main(stdio: Stdio, env: Env, clock: Clock, fs: Fs, u: Unsafe) -> Int
     if api_key == ""
         stdio.eprintln("error: set ANTHROPIC_API_KEY in the environment")
         return 1
+
+    // capa_http v0.1.2 inserts only `./libraries/capa_http/` into
+    // sys.path for its Python helper. The package manager puts
+    // it in `./vendor/capa_http/` instead; inject that path
+    // explicitly here so urllib_helper resolves. Fixed upstream
+    // in capa_http v0.1.3; this block goes away once the demo
+    // pins the newer release.
+    let sys_mod = py_import(u, "sys")
+    let os_mod  = py_import(u, "os")
+    let cwd     = py_invoke(u, os_mod.getcwd, [])
+    let vendor_dir = py_invoke(u, os_mod.path.join, [cwd, "vendor", "capa_http"])
+    py_invoke(u, sys_mod.path.insert, [0, vendor_dir])
 
     let http_raw = make_urllib_client(u)
     let llm = make_anthropic_client(http_raw, api_key, MODEL)

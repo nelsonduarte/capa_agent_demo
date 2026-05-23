@@ -62,7 +62,7 @@ impl ReadOnlyFs for ReadOnlyFsImpl
 // auditable in 5 lines.
 
 pub capability GetOnlyHttp
-    fun get(self, url: String) -> Result<String, HttpError>
+    fun fetch(self, url: String) -> Result<String, HttpError>
 
 pub type GetOnlyHttpImpl {
     http: Http,
@@ -78,8 +78,14 @@ fun host_allowed(url: String, hosts: List<String>) -> Bool
             return true
     return false
 
+// The method is named ``fetch`` rather than ``get`` to avoid a
+// codegen clash with the free function ``get(url)`` exported by
+// ``capa_http.http`` (which lands in module scope through the
+// transitive import). When the names collide, the transpiler
+// resolves ``http.get(url)`` to the free function and drops the
+// receiver. ``fetch`` is unambiguous.
 impl GetOnlyHttp for GetOnlyHttpImpl
-    fun get(self, url: String) -> Result<String, HttpError>
+    fun fetch(self, url: String) -> Result<String, HttpError>
         if not host_allowed(url, self.allowed_hosts)
             return Err(InvalidRequest("host not in allow-list: ${url}"))
         let req = Request {

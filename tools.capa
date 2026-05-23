@@ -48,7 +48,7 @@ pub fun tool_list_dir(fs: ReadOnlyFs, path: String) -> String
         Err(io) -> return "error: ${io.message}"
 
 pub fun tool_get_url(http: GetOnlyHttp, url: String) -> String
-    match http.get(url)
+    match http.fetch(url)
         Ok(body) -> return body
         Err(he)  ->
             let msg = match he

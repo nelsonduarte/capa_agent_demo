@@ -57,18 +57,22 @@ git clone https://github.com/nelsonduarte/capa_agent_demo
 cd capa_agent_demo
 capa install                    # fetches + verifies the seed libraries
 export ANTHROPIC_API_KEY=sk-ant-...
-capa --run agent.capa -- "What's the weather in Lisbon today?"
+capa --run agent.capa -- "What's the weather in Lisbon today? Use get_url with https://wttr.in/Lisbon?format=3"
 ```
 
-Sample transcript:
+On Windows the console defaults to cp1252 and weather responses
+contain emoji; export `PYTHONIOENCODING=utf-8` (Git Bash) or
+`$env:PYTHONIOENCODING = 'utf-8'` (PowerShell) before running.
+
+Sample transcript (real run, 2026-05-23):
 
 ```
-[user] What's the weather in Lisbon today?
+[user] What's the weather in Lisbon today? Use get_url with https://wttr.in/Lisbon?format=3
 [INFO] turn 1/5
 [tool call] get_url({"url": "https://wttr.in/Lisbon?format=3"})
-[tool result] Lisbon: ⛅ 18°C
+[tool result] lisbon: ☀️  +28°C
 [INFO] turn 2/5
-[llm] It's 18 °C and partly cloudy in Lisbon today.
+[llm] The weather in Lisbon today is **sunny** ☀️ with a temperature of **+28°C** (approximately 82°F).
 ```
 
 ## What the demo actually does
