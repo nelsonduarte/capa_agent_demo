@@ -32,7 +32,7 @@ import llm_client
 pub fun tool_read_file(fs: ReadOnlyFs, path: String) -> String
     match fs.read_file(path)
         Ok(text) -> return text
-        Err(io)  -> return "error: ${io.message}"
+        Err(io)  -> return "error: ${io}"
 
 pub fun tool_list_dir(fs: ReadOnlyFs, path: String) -> String
     match fs.list_dir(path)
@@ -45,7 +45,7 @@ pub fun tool_list_dir(fs: ReadOnlyFs, path: String) -> String
                 out = out + e
                 first = false
             return out
-        Err(io) -> return "error: ${io.message}"
+        Err(io) -> return "error: ${io}"
 
 pub fun tool_get_url(http: GetOnlyHttp, url: String) -> String
     match http.fetch(url)
